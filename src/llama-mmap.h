@@ -39,6 +39,13 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+
+    // positional read that does not move the file pointer and is safe to call from many threads
+    // only available when supports_read_at() is true (currently Windows)
+    bool supports_read_at() const;
+    void read_raw_at(void * ptr, size_t len, size_t offset) const;
+    // read_raw_at is fastest when (ptr - offset) is a multiple of this
+    size_t read_at_alignment() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
