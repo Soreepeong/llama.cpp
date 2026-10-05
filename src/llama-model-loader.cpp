@@ -10,9 +10,16 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1490,6 +1497,65 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+static int llama_load_env_int(const char * name, int def) {
+    const char * val = getenv(name);
+    return val ? std::max(1, atoi(val)) : def;
+}
+
+// small fixed thread pool for the parallel reads in load_all_data
+struct llama_read_pool {
+    explicit llama_read_pool(int n_threads) {
+        for (int i = 0; i < n_threads; ++i) {
+            workers.emplace_back([this] { run(); });
+        }
+    }
+
+    ~llama_read_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto & t : workers) {
+            t.join();
+        }
+    }
+
+    std::future<void> submit(std::function<void()> fn) {
+        std::packaged_task<void()> task(std::move(fn));
+        auto fut = task.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            tasks.push_back(std::move(task));
+        }
+        cv.notify_one();
+        return fut;
+    }
+
+private:
+    void run() {
+        for (;;) {
+            std::packaged_task<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [this] { return stop || !tasks.empty(); });
+                if (tasks.empty()) {
+                    return;
+                }
+                task = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::vector<std::thread> workers;
+    std::deque<std::packaged_task<void()>> tasks;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop = false;
+};
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1506,17 +1572,29 @@ bool llama_model_loader::load_all_data(
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
+    // parallel positional reads: tensors are split in chunks that worker threads read at the same time
+    // LLAMA_LOAD_LEGACY=1 selects the old single-threaded path
+    const bool fast_read = !use_mmap && getenv("LLAMA_LOAD_LEGACY") == nullptr &&
+        std::all_of(files.begin(), files.end(), [](const std::unique_ptr<llama_file> & f) { return f->supports_read_at(); });
+    const int    fast_threads = llama_load_env_int("LLAMA_LOAD_THREADS", 4);
+    const size_t fast_chunk   = (size_t) llama_load_env_int("LLAMA_LOAD_CHUNK_MIB", 32) * MiB;
+
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
-    constexpr size_t n_buffers = 4;
+    // with parallel reads use more and bigger buffers so that several reads can be in flight
+    const size_t n_buffers = fast_read ? (size_t) llama_load_env_int("LLAMA_LOAD_STAGING", 8) : 4;
 
     size_t alignment = 1;
     for (const auto & file : files) {
         alignment = std::max(file->read_alignment(), alignment);
+        if (fast_read) {
+            alignment = std::max(file->read_at_alignment(), alignment);
+        }
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    const size_t buffer_size = fast_read ? fast_chunk + 2 * alignment :
+        alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
@@ -1621,6 +1699,10 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // tensors loaded later by the parallel reader
+    std::vector<ggml_tensor *> fast_host;
+    std::vector<ggml_tensor *> fast_dev;
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1628,15 +1710,26 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
+        size_t n_size = ggml_nbytes(cur);
+
+        const bool from_mapping = use_mmap || lazy.has(cur);
+
+        if (fast_read && !from_mapping) {
+            if (ggml_backend_buffer_is_host(cur->buffer)) {
+                fast_host.push_back(cur);
+                continue;
+            }
+            if (upload_backend) {
+                fast_dev.push_back(cur);
+                continue;
+            }
+        }
+
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
         }
-
-        size_t n_size = ggml_nbytes(cur);
-
-        const bool from_mapping = use_mmap || lazy.has(cur);
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1749,6 +1842,134 @@ bool llama_model_loader::load_all_data(
         size_done += n_size;
     }
 
+    std::exception_ptr fast_error;
+    bool fast_aborted = false;
+
+    if (!fast_host.empty() || !fast_dev.empty()) {
+        LLAMA_LOG_INFO("%s: parallel read of %zu host + %zu device tensors: %d threads, %zu MiB chunks, %s I/O%s\n", __func__,
+                fast_host.size(), fast_dev.size(), fast_threads, fast_chunk / MiB,
+                files.at(0)->has_direct_io() ? "unbuffered" : "buffered",
+                fast_dev.empty() ? "" : format(", %zu staging buffers", n_buffers).c_str());
+
+        // read in file order
+        auto by_offset = [this](const ggml_tensor * a, const ggml_tensor * b) {
+            const auto * wa = get_weight(ggml_get_name(a));
+            const auto * wb = get_weight(ggml_get_name(b));
+            return wa->idx != wb->idx ? wa->idx < wb->idx : wa->offs < wb->offs;
+        };
+        std::sort(fast_host.begin(), fast_host.end(), by_offset);
+        std::sort(fast_dev.begin(),  fast_dev.end(),  by_offset);
+
+        struct read_piece {
+            ggml_tensor      * tensor;
+            const llama_file * file;
+            size_t file_offs; // offset in the file
+            size_t data_offs; // offset in the tensor
+            size_t size;
+        };
+        auto split = [&](const std::vector<ggml_tensor *> & list) {
+            std::vector<read_piece> pieces;
+            for (ggml_tensor * t : list) {
+                const auto * w = get_weight(ggml_get_name(t));
+                const size_t n = ggml_nbytes(t);
+                for (size_t o = 0; o < n; o += fast_chunk) {
+                    pieces.push_back({ t, files.at(w->idx).get(), w->offs + o, o, std::min(fast_chunk, n - o) });
+                }
+            }
+            return pieces;
+        };
+
+        std::atomic<bool> cancel{false};
+        auto finish = [&](std::future<void> & fut, size_t n) {
+            try {
+                fut.get();
+            } catch (...) {
+                if (!fast_error) {
+                    fast_error = std::current_exception();
+                }
+                cancel = true;
+            }
+            size_done += n;
+            if (progress_callback && !cancel && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                fast_aborted = true;
+                cancel = true;
+            }
+        };
+
+        llama_read_pool pool(fast_threads);
+
+        // host tensors: read straight into the tensor data
+        {
+            const auto pieces = split(fast_host);
+            std::vector<std::future<void>> futs;
+            futs.reserve(pieces.size());
+            for (const auto & p : pieces) {
+                futs.push_back(pool.submit([&cancel, p] {
+                    if (!cancel) {
+                        p.file->read_raw_at((char *) p.tensor->data + p.data_offs, p.size, p.file_offs);
+                    }
+                }));
+            }
+            for (size_t i = 0; i < futs.size(); ++i) {
+                finish(futs[i], pieces[i].size);
+            }
+            if (check_tensors && !cancel) {
+                for (ggml_tensor * t : fast_host) {
+                    validation_result.emplace_back(std::async(std::launch::async, [t] {
+                        return std::make_pair(t, ggml_validate_row_data(t->type, t->data, ggml_nbytes(t)));
+                    }));
+                }
+            }
+        }
+
+        // device tensors: read into the pinned staging buffers, upload from the main thread
+        // up to n_buffers reads are in flight, a buffer is reused once its upload event completes
+        if (!cancel && !fast_dev.empty()) {
+            const auto pieces = split(fast_dev);
+            std::deque<std::pair<std::future<void>, size_t>> inflight;
+            std::vector<size_t> piece_slot(pieces.size());
+            std::vector<char *> piece_src(pieces.size());
+
+            auto finish_front = [&]() {
+                auto item = std::move(inflight.front());
+                inflight.pop_front();
+                const auto & p = pieces[item.second];
+                finish(item.first, p.size);
+                if (!cancel) {
+                    const size_t slot = piece_slot[item.second];
+                    ggml_backend_tensor_set_async(upload_backend, p.tensor, piece_src[item.second], p.data_offs, p.size);
+                    ggml_backend_event_record(events[slot], upload_backend);
+                }
+            };
+
+            for (size_t i = 0; i < pieces.size() && !cancel; ++i) {
+                if (inflight.size() == n_buffers) {
+                    finish_front();
+                    if (cancel) {
+                        break;
+                    }
+                }
+                const size_t slot = i % n_buffers;
+                ggml_backend_event_synchronize(events[slot]);
+
+                // place the data so that the sector-aligned middle of the read is aligned in memory
+                const auto & p = pieces[i];
+                const size_t align = std::max<size_t>(p.file->read_at_alignment(), 1);
+                char * dst = (char *) host_ptrs[slot] + p.file_offs % align;
+                piece_slot[i] = slot;
+                piece_src[i]  = dst;
+                inflight.emplace_back(pool.submit([&cancel, p, dst] {
+                    if (!cancel) {
+                        p.file->read_raw_at(dst, p.size, p.file_offs);
+                    }
+                }), i);
+            }
+            while (!inflight.empty()) {
+                finish_front();
+            }
+        }
+    }
+
     // free temporary resources used for async uploads
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
@@ -1758,6 +1979,19 @@ bool llama_model_loader::load_all_data(
         ggml_backend_buffer_free(buf);
     }
     ggml_backend_free(upload_backend);
+
+    if (fast_error) {
+        for (auto & future : validation_result) {
+            future.wait();
+        }
+        std::rethrow_exception(fast_error);
+    }
+    if (fast_aborted) {
+        for (auto & future : validation_result) {
+            future.wait();
+        }
+        return false;
+    }
 
     // check validation results
     bool validation_failed = false;
