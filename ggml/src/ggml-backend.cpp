@@ -1799,6 +1799,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// GGML_SCHED_PROFILE=<n>: per-backend wall time of the splits (input copies vs compute, each split synchronized),
+// averaged over every n graph computes and printed to stderr. Measurement only; the syncs remove any overlap.
+static int sched_profile_period() {
+    static int period = -1;
+    if (period < 0) {
+        const char * env = getenv("GGML_SCHED_PROFILE");
+        period = env ? std::max(0, atoi(env)) : 0;
+    }
+    return period;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1809,10 +1820,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    const int  prof_period = sched_profile_period();
+    const bool prof        = prof_period > 0;
+    static double  prof_copy_us[GGML_SCHED_MAX_BACKENDS];
+    static double  prof_comp_us[GGML_SCHED_MAX_BACKENDS];
+    static int64_t prof_n_splits[GGML_SCHED_MAX_BACKENDS];
+    static int64_t prof_n_nodes[GGML_SCHED_MAX_BACKENDS];
+    static int     prof_n_graphs = 0;
+    static double  prof_graph_us = 0.0;
+    const int64_t prof_t_graph = prof ? ggml_time_us() : 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
+        int64_t prof_t1 = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1952,9 +1975,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            if (prof) {
+                // the copies above are async; charge their completion to the copy phase
+                ggml_backend_synchronize(split_backend);
+                prof_t1 = ggml_time_us();
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (prof) {
+                ggml_backend_synchronize(split_backend);
+                const int64_t t2 = ggml_time_us();
+                prof_copy_us[split_backend_id] += (double) (prof_t1 - prof_t0);
+                prof_comp_us[split_backend_id] += (double) (t2 - prof_t1);
+                prof_n_splits[split_backend_id]++;
+                prof_n_nodes[split_backend_id] += split->graph.n_nodes;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1996,6 +2032,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (prof) {
+        prof_graph_us += (double) (ggml_time_us() - prof_t_graph);
+        if (++prof_n_graphs >= prof_period) {
+            GGML_LOG_INFO("sched_profile: %d graphs, %.2f ms/graph, %d splits/graph\n",
+                    prof_n_graphs, prof_graph_us / 1000.0 / prof_n_graphs, sched->n_splits);
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (prof_n_splits[b] == 0) {
+                    continue;
+                }
+                GGML_LOG_INFO("sched_profile:   %-10s copy %7.2f ms  compute %7.2f ms  (%5.1f splits, %6.1f nodes per graph)\n",
+                        ggml_backend_name(sched->backends[b]),
+                        prof_copy_us[b] / 1000.0 / prof_n_graphs, prof_comp_us[b] / 1000.0 / prof_n_graphs,
+                        (double) prof_n_splits[b] / prof_n_graphs, (double) prof_n_nodes[b] / prof_n_graphs);
+                prof_copy_us[b] = prof_comp_us[b] = 0.0;
+                prof_n_splits[b] = prof_n_nodes[b] = 0;
+            }
+            prof_n_graphs = 0;
+            prof_graph_us = 0.0;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
