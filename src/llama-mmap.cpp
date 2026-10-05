@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 
+#include <atomic>
 #include <cstring>
 #include <climits>
 #include <cstdlib>
@@ -70,7 +71,10 @@ static std::string llama_format_win_err(DWORD err) {
 
 struct llama_file::impl {
 #if defined(_WIN32)
-    HANDLE fp_win32;
+    mutable HANDLE fp_win32;
+    std::string fp_name;   // for reopening the buffered handle after release_buffered()
+    std::string fp_mode;
+    mutable size_t fp_pos = 0;   // its file pointer while released
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -86,7 +90,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fp_name(fname), fp_mode(mode) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -231,6 +235,19 @@ struct llama_file::impl {
         return pos_align;
     }
 
+    // LLAMA_LOAD_DEBUG: bytes read straight into the destination vs. through the bounce buffer
+    struct read_stats {
+        std::atomic<uint64_t> direct{0}, bounced{0}, whole_bounced{0};
+        size_t mem_align = 0;
+        ~read_stats() {
+            if (getenv("LLAMA_LOAD_DEBUG") && (direct || bounced)) {
+                fprintf(stderr, "llama_file: read_raw_at direct %.2f GiB, bounced %.2f GiB (whole-range %.2f GiB), mem_align %zu\n",
+                        direct / 1073741824.0, bounced / 1073741824.0, whole_bounced / 1073741824.0, mem_align);
+            }
+        }
+    };
+    static read_stats & stats() { static read_stats s; return s; }
+
     void read_raw_at(void * ptr, size_t len, size_t offset) const {
         GGML_ASSERT(supports_read_at());
         if (len == 0) {
@@ -245,7 +262,10 @@ struct llama_file::impl {
         const size_t m0  = (offset + pos_align - 1) & ~(pos_align - 1);
         const size_t m1  = end & ~(pos_align - 1);
         char * dst = (char *) ptr;
+        stats().mem_align = pos_mem_align;
         if (m0 < m1 && (((uintptr_t) (dst + (m0 - offset))) & (pos_mem_align - 1)) == 0) {
+            stats().direct += m1 - m0;
+            stats().bounced += len - (m1 - m0);
             if (m0 > offset) {
                 pread_bounce(dst, m0 - offset, offset);
             }
@@ -254,6 +274,8 @@ struct llama_file::impl {
                 pread_bounce(dst + (m1 - offset), end - m1, m1);
             }
         } else {
+            stats().bounced += len;
+            stats().whole_bounced += len;
             pread_bounce(dst, len, offset);
         }
     }
@@ -266,7 +288,30 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
+    void release_buffered() const {
+        if (!pos_direct || !owns_fp || !fp) {
+            return;
+        }
+        fp_pos = tell();
+        std::fclose(fp);
+        fp       = nullptr;
+        fp_win32 = INVALID_HANDLE_VALUE;
+    }
+
+    void ensure_fp() const {
+        if (fp) {
+            return;
+        }
+        fp = ggml_fopen(fp_name.c_str(), fp_mode.c_str());
+        if (fp == NULL) {
+            throw std::runtime_error(format("failed to reopen %s: %s", fp_name.c_str(), strerror(errno)));
+        }
+        fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
+        seek(fp_pos, SEEK_SET);
+    }
+
     size_t tell() const {
+        ensure_fp();
         LARGE_INTEGER li;
         li.QuadPart = 0;
         BOOL ret = SetFilePointerEx(fp_win32, li, &li, FILE_CURRENT);
@@ -282,6 +327,7 @@ struct llama_file::impl {
         static_assert(SEEK_CUR == FILE_CURRENT, "SEEK_CUR != FILE_CURRENT");
         static_assert(SEEK_END == FILE_END, "SEEK_END != FILE_END");
 
+        ensure_fp();
         LARGE_INTEGER li;
         li.QuadPart = offset;
         BOOL ret = SetFilePointerEx(fp_win32, li, NULL, whence);
@@ -291,6 +337,7 @@ struct llama_file::impl {
     }
 
     void read_raw(void * ptr, size_t len) {
+        ensure_fp();
         size_t bytes_read = 0;
         while (bytes_read < len) {
             size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
@@ -314,6 +361,7 @@ struct llama_file::impl {
     }
 
     void write_raw(const void * ptr, size_t len) const {
+        ensure_fp();
         size_t bytes_written = 0;
         while (bytes_written < len) {
             size_t chunk_size = std::min<size_t>(len - bytes_written, 64*1024*1024);
@@ -587,7 +635,7 @@ struct llama_file::impl {
 
     size_t alignment = 1;
 
-    FILE * fp{};
+    mutable FILE * fp{};   // mutable: closed and reopened by release_buffered()/ensure_fp() on Windows
     size_t size{};
     bool owns_fp = true;
 };
@@ -608,8 +656,15 @@ bool llama_file::supports_read_at() const { return pimpl->supports_read_at(); }
 size_t llama_file::read_at_alignment() const { return pimpl->read_at_alignment(); }
 void llama_file::read_raw_at(void * ptr, size_t len, size_t offset) const { pimpl->read_raw_at(ptr, len, offset); }
 
+void llama_file::release_buffered() const {
+#ifdef _WIN32
+    pimpl->release_buffered();
+#endif
+}
+
 int llama_file::file_id() const {
 #ifdef _WIN32
+    pimpl->ensure_fp();
     return _fileno(pimpl->fp);
 #else
     if (pimpl->fd != -1) {

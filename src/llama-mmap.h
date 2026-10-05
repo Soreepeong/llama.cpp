@@ -46,6 +46,10 @@ struct llama_file {
     void read_raw_at(void * ptr, size_t len, size_t offset) const;
     // read_raw_at is fastest when (ptr - offset) is a multiple of this
     size_t read_at_alignment() const;
+    // close the buffered handle until it is needed again (Windows, direct I/O only): while a buffered
+    // handle has read the file, NTFS checks cache coherency on every unbuffered read, which caps
+    // read_raw_at at ~4.5 GB/s on a 7 GB/s drive; seek/tell/read_raw/write_raw/file_id reopen it
+    void release_buffered() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
