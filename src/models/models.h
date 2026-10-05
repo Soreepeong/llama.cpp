@@ -2724,6 +2724,10 @@ struct llama_model_glm5_next : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // build the helpers without the trunk, so graph_mtp can reuse them
+        struct no_build {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build);
+
         // collapse the hc streams with per-stream weights
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
@@ -2763,13 +2767,21 @@ struct llama_model_glm5_next : public llama_model_base {
                                       int64_t d_conv, int64_t head_dim, int64_t n_head_kda,
                                       int64_t d_inner, int64_t n_seq_tokens, int64_t n_seqs, int il);
 
+        // headless: keep only cache writes when no logits or hidden rows are needed
         ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
-                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
+                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il,
+                                         bool headless = false);
 
         ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                       const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
-                                      llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il);
+                                      llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il,
+                                      bool headless = false);
 
+    };
+
+    // the NextN / MTP draft head: one DSA block appended after the trunk
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
