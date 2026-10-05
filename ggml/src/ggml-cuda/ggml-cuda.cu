@@ -4277,8 +4277,121 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_PROFILE=<n>: GPU time per op (cudaEvent pairs around every node, CUDA graphs disabled while profiling),
+// aggregated by op + tensor name (layer suffix stripped) and printed every n graphs. Measurement aid only.
+static int ggml_cuda_prof_period() {
+    static int period = -1;
+    if (period < 0) {
+        const char * env = getenv("GGML_CUDA_PROFILE");
+        period = env ? std::max(0, atoi(env)) : 0;
+    }
+    return period;
+}
+
+static bool ggml_cuda_prof_enabled() {
+    return ggml_cuda_prof_period() > 0;
+}
+
+struct ggml_cuda_prof_state {
+    std::vector<cudaEvent_t> events;              // pool, pairs
+    std::vector<std::string> keys;                // key per pair of the current graph
+    size_t                   n_used   = 0;        // events used in the current graph
+    std::map<std::string, std::pair<double, int64_t>> acc; // key -> (ms, count)
+    int    n_graphs  = 0;
+    double total_ms  = 0.0;
+
+    cudaEvent_t next() {
+        if (n_used == events.size()) {
+            cudaEvent_t ev;
+            CUDA_CHECK(cudaEventCreate(&ev));
+            events.push_back(ev);
+        }
+        return events[n_used++];
+    }
+};
+
+static ggml_cuda_prof_state & ggml_cuda_prof() {
+    static ggml_cuda_prof_state st;
+    return st;
+}
+
+static std::string ggml_cuda_prof_key(const ggml_tensor * node, int n_fused) {
+    std::string name = node->name;
+    // strip a trailing "-<layer>" and " (view)" / " (reshaped)" etc.
+    size_t par = name.find(" (");
+    if (par != std::string::npos) {
+        name.erase(par);
+    }
+    size_t dash = name.rfind('-');
+    if (dash != std::string::npos && dash + 1 < name.size() &&
+        std::all_of(name.begin() + dash + 1, name.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        name.erase(dash);
+    }
+    std::string key = std::string(ggml_op_desc(node)) + " " + name;
+    if (n_fused > 1) {
+        key += " (fused " + std::to_string(n_fused) + ")";
+    }
+    return key;
+}
+
+static void ggml_cuda_prof_begin(ggml_backend_cuda_context * cuda_ctx) {
+    CUDA_CHECK(cudaEventRecord(ggml_cuda_prof().next(), cuda_ctx->stream()));
+}
+
+static void ggml_cuda_prof_end(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * node, int n_fused) {
+    auto & st = ggml_cuda_prof();
+    CUDA_CHECK(cudaEventRecord(st.next(), cuda_ctx->stream()));
+    st.keys.push_back(ggml_cuda_prof_key(node, n_fused));
+}
+
+static void ggml_cuda_prof_flush(ggml_backend_cuda_context * cuda_ctx) {
+    auto & st = ggml_cuda_prof();
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    double graph_ms = 0.0;
+    for (size_t i = 0; i < st.keys.size(); i++) {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, st.events[2*i], st.events[2*i + 1]));
+        auto & e = st.acc[st.keys[i]];
+        e.first  += ms;
+        e.second += 1;
+        graph_ms += ms;
+    }
+    if (st.keys.size() >= 2) {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, st.events[0], st.events[2*st.keys.size() - 1]));
+        st.total_ms += ms;
+    }
+    st.keys.clear();
+    st.n_used = 0;
+    if (++st.n_graphs >= ggml_cuda_prof_period()) {
+        std::vector<std::pair<std::string, std::pair<double, int64_t>>> rows(st.acc.begin(), st.acc.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+        double sum_ms = 0.0;
+        int64_t sum_n = 0;
+        for (const auto & r : rows) {
+            sum_ms += r.second.first;
+            sum_n  += r.second.second;
+        }
+        GGML_LOG_INFO("cuda_profile: %d graphs, %.2f ms/graph span, %.2f ms/graph sum of ops, %.1f ops/graph\n",
+                st.n_graphs, st.total_ms / st.n_graphs, sum_ms / st.n_graphs, (double) sum_n / st.n_graphs);
+        int shown = 0;
+        for (const auto & r : rows) {
+            if (shown++ >= 40) {
+                break;
+            }
+            GGML_LOG_INFO("cuda_profile:   %8.3f ms  %7.1f ops  %6.1f us/op  %s\n",
+                    r.second.first / st.n_graphs, (double) r.second.second / st.n_graphs,
+                    1000.0 * r.second.first / r.second.second, r.first.c_str());
+        }
+        st.acc.clear();
+        st.n_graphs = 0;
+        st.total_ms = 0.0;
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    const bool prof = ggml_cuda_prof_enabled() && !use_cuda_graph;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4417,6 +4530,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (prof) {
+                    ggml_cuda_prof_begin(cuda_ctx);
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4426,6 +4543,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (prof) {
+                        ggml_cuda_prof_end(cuda_ctx, cgraph->nodes[i + nodes_to_skip], nodes_to_skip + 1);
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4451,6 +4571,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (prof) {
+                    ggml_cuda_prof_end(cuda_ctx, node, 1);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4527,7 +4651,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && !ggml_cuda_prof_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4567,6 +4691,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (ggml_cuda_prof_enabled() && !use_cuda_graph) {
+        ggml_cuda_prof_flush(cuda_ctx);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

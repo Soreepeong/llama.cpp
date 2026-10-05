@@ -927,6 +927,14 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    // GGML_SCHED_PROFILE accumulators (zeroed by calloc)
+    double  prof_copy_us[GGML_SCHED_MAX_BACKENDS];
+    double  prof_comp_us[GGML_SCHED_MAX_BACKENDS];
+    int64_t prof_n_splits[GGML_SCHED_MAX_BACKENDS];
+    int64_t prof_n_nodes[GGML_SCHED_MAX_BACKENDS];
+    int     prof_n_graphs;
+    double  prof_graph_us;
+
     int n_backends;
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
@@ -1822,12 +1830,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     const int  prof_period = sched_profile_period();
     const bool prof        = prof_period > 0;
-    static double  prof_copy_us[GGML_SCHED_MAX_BACKENDS];
-    static double  prof_comp_us[GGML_SCHED_MAX_BACKENDS];
-    static int64_t prof_n_splits[GGML_SCHED_MAX_BACKENDS];
-    static int64_t prof_n_nodes[GGML_SCHED_MAX_BACKENDS];
-    static int     prof_n_graphs = 0;
-    static double  prof_graph_us = 0.0;
+    double  * prof_copy_us  = sched->prof_copy_us;
+    double  * prof_comp_us  = sched->prof_comp_us;
+    int64_t * prof_n_splits = sched->prof_n_splits;
+    int64_t * prof_n_nodes  = sched->prof_n_nodes;
+    int     & prof_n_graphs = sched->prof_n_graphs;
+    double  & prof_graph_us = sched->prof_graph_us;
     const int64_t prof_t_graph = prof ? ggml_time_us() : 0;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -2037,8 +2045,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (prof) {
         prof_graph_us += (double) (ggml_time_us() - prof_t_graph);
         if (++prof_n_graphs >= prof_period) {
-            GGML_LOG_INFO("sched_profile: %d graphs, %.2f ms/graph, %d splits/graph\n",
-                    prof_n_graphs, prof_graph_us / 1000.0 / prof_n_graphs, sched->n_splits);
+            GGML_LOG_INFO("sched_profile[%p]: %d graphs, %.2f ms/graph, %d splits/graph\n",
+                    (void *) sched, prof_n_graphs, prof_graph_us / 1000.0 / prof_n_graphs, sched->n_splits);
             for (int b = 0; b < sched->n_backends; b++) {
                 if (prof_n_splits[b] == 0) {
                     continue;
