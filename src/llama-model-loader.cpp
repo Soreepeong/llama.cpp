@@ -1497,9 +1497,9 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
-static int llama_load_env_int(const char * name, int def) {
+static int llama_load_env_int(const char * name, int def, int min_val = 1) {
     const char * val = getenv(name);
-    return val ? std::max(1, atoi(val)) : def;
+    return val ? std::max(min_val, atoi(val)) : def;
 }
 
 // small fixed thread pool for the parallel reads in load_all_data
@@ -1898,20 +1898,108 @@ bool llama_model_loader::load_all_data(
 
         llama_read_pool pool(fast_threads);
 
+        // the buffered handles have read the GGUF metadata; while they are open, every unbuffered read pays
+        // for a cache coherency check (measured: 4.3-4.8 instead of 6.2 GB/s), so close them for the bulk reads
+        for (const auto & f : files) {
+            f->release_buffered();
+        }
+
         // host tensors: read straight into the tensor data
         {
+            // fault the destination pages in first, from many threads: otherwise each unbuffered read
+            // demand-zeroes its pages inside the read call, which caps a large load at ~4.5 GB/s
+            // (LLAMA_LOAD_PREFAULT = number of threads, 0 = off)
+            const int prefault_threads = llama_load_env_int("LLAMA_LOAD_PREFAULT", 16, 0);
+            if (prefault_threads > 0 && !fast_host.empty()) {
+                const int64_t t_pf0 = ggml_time_us();
+                std::vector<std::pair<char *, size_t>> ranges;
+                size_t total = 0;
+                for (ggml_tensor * t : fast_host) {
+                    ranges.emplace_back((char *) t->data, ggml_nbytes(t));
+                    total += ggml_nbytes(t);
+                }
+                std::atomic<size_t> next_page{0};
+                const size_t page = 4096;
+                const size_t n_pages = (total + page - 1) / page;
+                std::vector<std::thread> pf;
+                for (int i = 0; i < prefault_threads; ++i) {
+                    pf.emplace_back([&] {
+                        // claim blocks of pages; map the global page index onto the tensor ranges
+                        constexpr size_t block = 4096;   // pages per claim (16 MiB)
+                        for (size_t b; (b = next_page.fetch_add(block)) < n_pages;) {
+                            size_t skip = b * page;
+                            size_t left = std::min(block, n_pages - b) * page;
+                            for (const auto & r : ranges) {
+                                if (left == 0) {
+                                    break;
+                                }
+                                if (skip >= r.second) {
+                                    skip -= r.second;
+                                    continue;
+                                }
+                                const size_t n = std::min(left, r.second - skip);
+                                for (size_t o = 0; o < n; o += page) {
+                                    ((volatile char *) r.first)[skip + o] = 0;
+                                }
+                                left -= n;
+                                skip = 0;
+                            }
+                        }
+                    });
+                }
+                for (auto & t : pf) {
+                    t.join();
+                }
+                if (getenv("LLAMA_LOAD_DEBUG")) {
+                    const double s = (ggml_time_us() - t_pf0) / 1e6;
+                    LLAMA_LOG_INFO("%s: prefault %.2f GiB with %d threads in %.2f s (%.2f GB/s)\n",
+                                   __func__, total / 1073741824.0, prefault_threads, s, total / s / 1e9);
+                }
+            }
+
             const auto pieces = split(fast_host);
             std::vector<std::future<void>> futs;
             futs.reserve(pieces.size());
-            for (const auto & p : pieces) {
-                futs.push_back(pool.submit([&cancel, p] {
+            std::atomic<int64_t> busy_us{0};
+            const int64_t t_host0 = ggml_time_us();
+            // LLAMA_LOAD_TRACE=<path>: one line per piece (file, offset, size, start/end us, address)
+            const char * trace_path = getenv("LLAMA_LOAD_TRACE");
+            std::vector<std::array<int64_t, 6>> trace(trace_path ? pieces.size() : 0);
+            for (size_t i = 0; i < pieces.size(); ++i) {
+                const auto & p = pieces[i];
+                futs.push_back(pool.submit([&cancel, &busy_us, &trace, i, p, t_host0] {
                     if (!cancel) {
+                        const int64_t t0 = ggml_time_us();
                         p.file->read_raw_at((char *) p.tensor->data + p.data_offs, p.size, p.file_offs);
+                        const int64_t t1 = ggml_time_us();
+                        busy_us += t1 - t0;
+                        if (!trace.empty()) {
+                            trace[i] = { (int64_t) (uintptr_t) p.file, (int64_t) p.file_offs, (int64_t) p.size,
+                                         t0 - t_host0, t1 - t_host0, (int64_t) (uintptr_t) ((char *) p.tensor->data + p.data_offs) };
+                        }
                     }
                 }));
             }
             for (size_t i = 0; i < futs.size(); ++i) {
                 finish(futs[i], pieces[i].size);
+            }
+            if (getenv("LLAMA_LOAD_DEBUG") && !pieces.empty()) {
+                size_t bytes = 0;
+                for (const auto & p : pieces) {
+                    bytes += p.size;
+                }
+                const double wall = (ggml_time_us() - t_host0) / 1e6;
+                LLAMA_LOG_INFO("%s: host phase: %zu pieces, %.2f GiB, wall %.2f s (%.2f GB/s), read busy %.2f s over %d threads\n",
+                               __func__, pieces.size(), bytes / 1073741824.0, wall, bytes / wall / 1e9, busy_us / 1e6, fast_threads);
+            }
+            if (trace_path && !trace.empty()) {
+                if (FILE * tf = fopen(trace_path, "w")) {
+                    for (const auto & r : trace) {
+                        fprintf(tf, "%lld %lld %lld %lld %lld %lld\n", (long long) r[0], (long long) r[1], (long long) r[2],
+                                (long long) r[3], (long long) r[4], (long long) r[5]);
+                    }
+                    fclose(tf);
+                }
             }
             if (check_tensors && !cancel) {
                 for (ggml_tensor * t : fast_host) {
