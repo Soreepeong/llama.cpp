@@ -1905,7 +1905,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                const int64_t t_alloc_us = ggml_time_us();
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (buf) {
+                    LLAMA_LOG_INFO("%s: allocated %12s buffer of %8.2f MiB in %.2f s\n", __func__,
+                            ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
+                            (ggml_time_us() - t_alloc_us) / 1e6);
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1970,10 +1976,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    const int64_t t_load_all_us = ggml_time_us();
+    size_t n_load_all = 0;
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        const int64_t t_load_us = ggml_time_us();
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+        size_t n_bytes = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            n_bytes += ggml_nbytes(t);
+        }
+        n_load_all += n_bytes;
+        const double t_s = (ggml_time_us() - t_load_us) / 1e6;
+        LLAMA_LOG_INFO("%s: loaded %12s tensors: %8.2f MiB in %.2f s (%.2f GB/s)\n", __func__,
+                buf_map.empty() ? "?" : ggml_backend_buffer_name(buf_map.begin()->second),
+                n_bytes / 1024.0 / 1024.0, t_s, t_s > 0 ? n_bytes / t_s / 1e9 : 0.0);
+    }
+    {
+        const double t_s = (ggml_time_us() - t_load_all_us) / 1e6;
+        LLAMA_LOG_INFO("%s: loaded all tensors: %.2f MiB in %.2f s (%.2f GB/s)\n", __func__,
+                n_load_all / 1024.0 / 1024.0, t_s, t_s > 0 ? n_load_all / t_s / 1e9 : 0.0);
     }
 
     if (use_mmap_buffer) {
