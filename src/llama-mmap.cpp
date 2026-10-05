@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <memory>
+#include <string>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -84,7 +86,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -93,6 +95,167 @@ struct llama_file::impl {
         seek(0, SEEK_END);
         size = tell();
         seek(0, SEEK_SET);
+
+        if (std::strcmp(mode, "rb") == 0) {
+            open_pos_handle(fname, use_direct_io);
+        }
+    }
+
+    // second handle for positional (overlapped) reads, unbuffered with direct I/O
+    // the CRT handle in fp stays buffered and serves metadata reads, seek and file_id
+    void open_pos_handle(const char * fname, bool use_direct_io) {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, fname, -1, nullptr, 0);
+        if (n <= 0) {
+            return;
+        }
+        std::wstring wname(n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, fname, -1, wname.data(), n);
+
+        DWORD flags = FILE_FLAG_OVERLAPPED;
+        if (use_direct_io) {
+            flags |= FILE_FLAG_NO_BUFFERING;
+        }
+        h_pos = CreateFileW(wname.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, flags, NULL);
+        if (h_pos == INVALID_HANDLE_VALUE && use_direct_io) {
+            LLAMA_LOG_WARN("%s: unbuffered open of '%s' failed: %s, falling back to buffered I/O\n",
+                    __func__, fname, GetErrorMessageWin32(GetLastError()).c_str());
+            use_direct_io = false;
+            h_pos = CreateFileW(wname.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+        }
+        if (h_pos == INVALID_HANDLE_VALUE) {
+            LLAMA_LOG_WARN("%s: positional open of '%s' failed: %s\n", __func__, fname, GetErrorMessageWin32(GetLastError()).c_str());
+            return;
+        }
+        if (!use_direct_io) {
+            return;
+        }
+
+        // offset and length must be multiples of the logical sector size
+        size_t sector = 4096;
+        FILE_STORAGE_INFO si = {};
+        if (GetFileInformationByHandleEx(h_pos, FileStorageInfo, &si, sizeof(si)) && si.LogicalBytesPerSector > 0) {
+            sector = std::max<size_t>(si.LogicalBytesPerSector, si.PhysicalBytesPerSectorForPerformance);
+        }
+        if ((sector & (sector - 1)) != 0 || sector > 1024*1024) {
+            sector = 4096;
+        }
+        // buffer address must match the device alignment requirement
+        FILE_ALIGNMENT_INFO ai = {};
+        size_t mem_align = sector;
+        if (GetFileInformationByHandleEx(h_pos, FileAlignmentInfo, &ai, sizeof(ai))) {
+            mem_align = (size_t) ai.AlignmentRequirement + 1;
+        }
+        pos_align     = sector;
+        pos_mem_align = mem_align;
+        pos_direct    = true;
+    }
+
+    // one positional read on h_pos, returns the number of bytes read (short only at EOF)
+    size_t pread_once(void * ptr, size_t len, size_t offset) const {
+        GGML_ASSERT(len <= 0x40000000);
+        thread_local struct ev_holder {
+            HANDLE h = CreateEventW(NULL, TRUE, FALSE, NULL);
+            ~ev_holder() { if (h) { CloseHandle(h); } }
+        } ev;
+        OVERLAPPED ov = {};
+        ov.Offset     = (DWORD) (offset & 0xFFFFFFFFull);
+        ov.OffsetHigh = (DWORD) (offset >> 32);
+        ov.hEvent     = ev.h;
+        DWORD got = 0;
+        if (!ReadFile(h_pos, ptr, (DWORD) len, NULL, &ov)) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_HANDLE_EOF) {
+                return 0;
+            }
+            if (err != ERROR_IO_PENDING) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(err).c_str()));
+            }
+        }
+        if (!GetOverlappedResult(h_pos, &ov, &got, TRUE)) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_HANDLE_EOF) {
+                return 0;
+            }
+            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(err).c_str()));
+        }
+        return got;
+    }
+
+    // read exactly len bytes, in pieces of at most 1 GiB (offset and len stay aligned if they were)
+    void pread_full(void * ptr, size_t len, size_t offset) const {
+        size_t done = 0;
+        while (done < len) {
+            const size_t n   = std::min<size_t>(len - done, 0x40000000);
+            const size_t got = pread_once((char *) ptr + done, n, offset + done);
+            if (got != n) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+            done += n;
+        }
+    }
+
+    // unbuffered read of an unaligned range through an aligned per-thread bounce buffer
+    void pread_bounce(void * dst, size_t len, size_t offset) const {
+        constexpr size_t bounce_size = 4u*1024*1024;
+        struct aligned_deleter { void operator()(void * p) const { _aligned_free(p); } };
+        thread_local std::unique_ptr<void, aligned_deleter> bounce;
+        thread_local size_t bounce_align = 0;
+        if (!bounce || bounce_align < pos_align) {
+            bounce.reset(_aligned_malloc(bounce_size, std::max<size_t>(pos_align, 4096)));
+            bounce_align = pos_align;
+            if (!bounce) {
+                throw std::runtime_error("failed to allocate bounce buffer");
+            }
+        }
+        size_t copied = 0;
+        while (copied < len) {
+            const size_t cur   = offset + copied;
+            const size_t a     = cur & ~(pos_align - 1);
+            const size_t skip  = cur - a;
+            const size_t n     = std::min<size_t>(bounce_size, (skip + (len - copied) + pos_align - 1) & ~(pos_align - 1));
+            const size_t got   = pread_once(bounce.get(), n, a);
+            const size_t count = std::min(n - skip, len - copied);
+            if (got < skip + count) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+            memcpy((char *) dst + copied, (char *) bounce.get() + skip, count);
+            copied += count;
+        }
+    }
+
+    bool supports_read_at() const {
+        return h_pos != INVALID_HANDLE_VALUE;
+    }
+
+    size_t read_at_alignment() const {
+        return pos_align;
+    }
+
+    void read_raw_at(void * ptr, size_t len, size_t offset) const {
+        GGML_ASSERT(supports_read_at());
+        if (len == 0) {
+            return;
+        }
+        if (!pos_direct) {
+            pread_full(ptr, len, offset);
+            return;
+        }
+        // read the sector-aligned middle straight into ptr, the unaligned head and tail through the bounce buffer
+        const size_t end = offset + len;
+        const size_t m0  = (offset + pos_align - 1) & ~(pos_align - 1);
+        const size_t m1  = end & ~(pos_align - 1);
+        char * dst = (char *) ptr;
+        if (m0 < m1 && (((uintptr_t) (dst + (m0 - offset))) & (pos_mem_align - 1)) == 0) {
+            if (m0 > offset) {
+                pread_bounce(dst, m0 - offset, offset);
+            }
+            pread_full(dst + (m0 - offset), m1 - m0, m0);
+            if (end > m1) {
+                pread_bounce(dst + (m1 - offset), end - m1, m1);
+            }
+        } else {
+            pread_bounce(dst, len, offset);
+        }
     }
 
     impl(FILE * file) : owns_fp(false) {
@@ -172,14 +335,22 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        return pos_direct;
     }
 
     ~impl() {
+        if (h_pos != INVALID_HANDLE_VALUE) {
+            CloseHandle(h_pos);
+        }
         if (fp && owns_fp) {
             std::fclose(fp);
         }
     }
+
+    HANDLE h_pos = INVALID_HANDLE_VALUE;
+    bool   pos_direct    = false;
+    size_t pos_align     = 1;
+    size_t pos_mem_align = 1;
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
@@ -387,6 +558,18 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    bool supports_read_at() const {
+        return false;
+    }
+
+    size_t read_at_alignment() const {
+        return 1;
+    }
+
+    void read_raw_at(void *, size_t, size_t) const {
+        GGML_ABORT("read_raw_at is not supported on this platform");
+    }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -421,6 +604,9 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+bool llama_file::supports_read_at() const { return pimpl->supports_read_at(); }
+size_t llama_file::read_at_alignment() const { return pimpl->read_at_alignment(); }
+void llama_file::read_raw_at(void * ptr, size_t len, size_t offset) const { pimpl->read_raw_at(ptr, len, offset); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
