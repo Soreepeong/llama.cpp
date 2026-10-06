@@ -14,7 +14,9 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -1502,12 +1504,83 @@ static int llama_load_env_int(const char * name, int def, int min_val = 1) {
     return val ? std::max(min_val, atoi(val)) : def;
 }
 
-// small fixed thread pool for the parallel reads in load_all_data
-struct llama_read_pool {
-    explicit llama_read_pool(int n_threads) {
-        for (int i = 0; i < n_threads; ++i) {
-            workers.emplace_back([this] { run(); });
+// LLAMA_LOAD_MIRRORS="<prefix>=<mirror prefix>[;...]": a byte-identical copy of a model file on another drive,
+// e.g. "C:\models=Z:\models" for C:\models\x\y.gguf -> Z:\models\x\y.gguf. Used only when its size and
+// modification time match the original; reads are then spread over both drives.
+static std::unique_ptr<llama_file> llama_open_mirror(const llama_file & file, bool use_direct_io) {
+    const char * env = getenv("LLAMA_LOAD_MIRRORS");
+    if (env == nullptr || file.path().empty()) {
+        return nullptr;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path src = fs::absolute(fs::u8path(file.path()), ec).lexically_normal();
+    if (ec) {
+        return nullptr;
+    }
+    auto key = [](const fs::path & p) {
+        std::string s = p.generic_u8string();
+#if defined(_WIN32)
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+#endif
+        while (!s.empty() && s.back() == '/') {
+            s.pop_back();
         }
+        return s;
+    };
+    const std::string src_key = key(src);
+    std::string spec = env;
+    for (size_t pos = 0; pos <= spec.size();) {
+        const size_t end = std::min(spec.find(';', pos), spec.size());
+        const std::string entry = spec.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t eq = entry.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const fs::path from = fs::absolute(fs::u8path(entry.substr(0, eq)), ec).lexically_normal();
+        const std::string from_key = key(from);
+        if (ec || from_key.empty() || src_key.compare(0, from_key.size(), from_key) != 0 ||
+                (src_key.size() > from_key.size() && src_key[from_key.size()] != '/')) {
+            continue;
+        }
+        const fs::path cand = fs::u8path(entry.substr(eq + 1)) / fs::u8path(src.generic_u8string().substr(from.generic_u8string().size())).relative_path();
+        if (!fs::is_regular_file(cand, ec)) {
+            continue;
+        }
+        if (fs::file_size(cand, ec) != file.size() || fs::last_write_time(cand, ec) != fs::last_write_time(src, ec) || ec) {
+            LLAMA_LOG_WARN("%s: ignoring mirror %s: size or modification time differs from %s\n", __func__,
+                    cand.u8string().c_str(), file.path().c_str());
+            continue;
+        }
+        try {
+            auto mirror = std::make_unique<llama_file>(cand.u8string().c_str(), "rb", use_direct_io);
+            mirror->release_buffered();
+            LLAMA_LOG_INFO("%s: mirror %s\n", __func__, cand.u8string().c_str());
+            return mirror;
+        } catch (const std::exception & e) {
+            LLAMA_LOG_WARN("%s: cannot open mirror %s: %s\n", __func__, cand.u8string().c_str(), e.what());
+        }
+    }
+    return nullptr;
+}
+
+// small fixed thread pool for the parallel reads in load_all_data
+// threads come in groups, one per source drive (the model's files, then their mirrors); every group takes
+// tasks from the same queue, so a faster drive simply takes more of them - no speeds need to be known
+struct llama_read_pool {
+    explicit llama_read_pool(const std::vector<int> & threads_per_source) {
+        for (size_t s = 0; s < threads_per_source.size(); ++s) {
+            for (int i = 0; i < threads_per_source[s]; ++i) {
+                workers.emplace_back([this, s] { source_idx() = (int) s; run(); });
+            }
+        }
+    }
+
+    // the source group of the calling worker thread (0 = the model's own files)
+    static int & source_idx() {
+        thread_local int idx = 0;
+        return idx;
     }
 
     ~llama_read_pool() {
@@ -1860,12 +1933,38 @@ bool llama_model_loader::load_all_data(
         std::sort(fast_host.begin(), fast_host.end(), by_offset);
         std::sort(fast_dev.begin(),  fast_dev.end(),  by_offset);
 
+        // byte-identical copies of the files on other drives (LLAMA_LOAD_MIRRORS): a second group of reader
+        // threads reads from them, taking pieces from the same queue as the first
+        std::vector<std::unique_ptr<llama_file>> mirrors(files.size());
+        bool any_mirror = false;
+        for (size_t i = 0; i < files.size(); ++i) {
+            mirrors[i] = llama_open_mirror(*files[i], use_direct_io);
+            // the staging buffers and their in-buffer offsets are sized for the model files' alignment
+            if (mirrors[i] && mirrors[i]->read_at_alignment() > files[i]->read_at_alignment()) {
+                LLAMA_LOG_WARN("%s: ignoring mirror %s: needs %zu-byte alignment, the model file %zu\n", __func__,
+                        mirrors[i]->path().c_str(), mirrors[i]->read_at_alignment(), files[i]->read_at_alignment());
+                mirrors[i].reset();
+            }
+            any_mirror |= mirrors[i] != nullptr;
+        }
+        std::vector<int> threads_per_source = { fast_threads };
+        if (any_mirror) {
+            threads_per_source.push_back(llama_load_env_int("LLAMA_LOAD_MIRROR_THREADS", fast_threads));
+        }
+        std::atomic<uint64_t> bytes_per_source[2] = {};
+
         struct read_piece {
             ggml_tensor      * tensor;
             const llama_file * file;
+            const llama_file * mirror; // the same bytes on another drive, or nullptr
             size_t file_offs; // offset in the file
             size_t data_offs; // offset in the tensor
             size_t size;
+
+            // the file the calling reader thread should use
+            const llama_file * source() const {
+                return mirror != nullptr && llama_read_pool::source_idx() == 1 ? mirror : file;
+            }
         };
         auto split = [&](const std::vector<ggml_tensor *> & list) {
             std::vector<read_piece> pieces;
@@ -1873,7 +1972,7 @@ bool llama_model_loader::load_all_data(
                 const auto * w = get_weight(ggml_get_name(t));
                 const size_t n = ggml_nbytes(t);
                 for (size_t o = 0; o < n; o += fast_chunk) {
-                    pieces.push_back({ t, files.at(w->idx).get(), w->offs + o, o, std::min(fast_chunk, n - o) });
+                    pieces.push_back({ t, files.at(w->idx).get(), mirrors.at(w->idx).get(), w->offs + o, o, std::min(fast_chunk, n - o) });
                 }
             }
             return pieces;
@@ -1896,7 +1995,7 @@ bool llama_model_loader::load_all_data(
             }
         };
 
-        llama_read_pool pool(fast_threads);
+        llama_read_pool pool(threads_per_source);
 
         // the buffered handles have read the GGUF metadata; while they are open, every unbuffered read pays
         // for a cache coherency check (measured: 4.3-4.8 instead of 6.2 GB/s), so close them for the bulk reads
@@ -1967,14 +2066,16 @@ bool llama_model_loader::load_all_data(
             std::vector<std::array<int64_t, 6>> trace(trace_path ? pieces.size() : 0);
             for (size_t i = 0; i < pieces.size(); ++i) {
                 const auto & p = pieces[i];
-                futs.push_back(pool.submit([&cancel, &busy_us, &trace, i, p, t_host0] {
+                futs.push_back(pool.submit([&cancel, &busy_us, &trace, &bytes_per_source, i, p, t_host0] {
                     if (!cancel) {
                         const int64_t t0 = ggml_time_us();
-                        p.file->read_raw_at((char *) p.tensor->data + p.data_offs, p.size, p.file_offs);
+                        const llama_file * src = p.source();
+                        src->read_raw_at((char *) p.tensor->data + p.data_offs, p.size, p.file_offs);
                         const int64_t t1 = ggml_time_us();
                         busy_us += t1 - t0;
+                        bytes_per_source[src == p.file ? 0 : 1] += p.size;
                         if (!trace.empty()) {
-                            trace[i] = { (int64_t) (uintptr_t) p.file, (int64_t) p.file_offs, (int64_t) p.size,
+                            trace[i] = { (int64_t) (uintptr_t) src, (int64_t) p.file_offs, (int64_t) p.size,
                                          t0 - t_host0, t1 - t_host0, (int64_t) (uintptr_t) ((char *) p.tensor->data + p.data_offs) };
                         }
                     }
@@ -1991,6 +2092,10 @@ bool llama_model_loader::load_all_data(
                 const double wall = (ggml_time_us() - t_host0) / 1e6;
                 LLAMA_LOG_INFO("%s: host phase: %zu pieces, %.2f GiB, wall %.2f s (%.2f GB/s), read busy %.2f s over %d threads\n",
                                __func__, pieces.size(), bytes / 1073741824.0, wall, bytes / wall / 1e9, busy_us / 1e6, fast_threads);
+                if (any_mirror) {
+                    LLAMA_LOG_INFO("%s: host phase by source: model files %.2f GiB, mirrors %.2f GiB\n", __func__,
+                                   bytes_per_source[0] / 1073741824.0, bytes_per_source[1] / 1073741824.0);
+                }
             }
             if (trace_path && !trace.empty()) {
                 if (FILE * tf = fopen(trace_path, "w")) {
@@ -2046,9 +2151,11 @@ bool llama_model_loader::load_all_data(
                 char * dst = (char *) host_ptrs[slot] + p.file_offs % align;
                 piece_slot[i] = slot;
                 piece_src[i]  = dst;
-                inflight.emplace_back(pool.submit([&cancel, p, dst] {
+                inflight.emplace_back(pool.submit([&cancel, &bytes_per_source, p, dst] {
                     if (!cancel) {
-                        p.file->read_raw_at(dst, p.size, p.file_offs);
+                        const llama_file * src = p.source();
+                        src->read_raw_at(dst, p.size, p.file_offs);
+                        bytes_per_source[src == p.file ? 0 : 1] += p.size;
                     }
                 }), i);
             }
