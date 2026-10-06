@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 #include <cstdio>
@@ -50,6 +51,8 @@ struct llama_file {
     // handle has read the file, NTFS checks cache coherency on every unbuffered read, which caps
     // read_raw_at at ~4.5 GB/s on a 7 GB/s drive; seek/tell/read_raw/write_raw/file_id reopen it
     void release_buffered() const;
+    // the path the file was opened with (empty for a llama_file wrapping a FILE *)
+    const std::string & path() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
