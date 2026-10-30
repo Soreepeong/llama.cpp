@@ -282,6 +282,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
+    // a full-vocab draft with its own embeddings but no head (a tied target's embeddings grafted in) uses them as its head,
+    // so it stays on its own device instead of reading the target's head through ctx_other
+    if (output == nullptr && tok_embd != nullptr && n_vocab_draft == n_vocab) {
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_draft }, TENSOR_DUPLICATED);
+    }
 
     if (hparams.n_lora_kv > 0) {
         const int64_t kv_lora_rank      = hparams.n_lora_kv;
