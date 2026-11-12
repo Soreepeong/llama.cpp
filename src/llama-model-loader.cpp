@@ -1663,7 +1663,7 @@ static int llama_load_env_int(const char * name, int def, int min_val = 1) {
 // modification time match the original; reads are then spread over both drives.
 static std::unique_ptr<llama_file> llama_open_mirror(const llama_file & file, bool use_direct_io) {
     const char * env = getenv("LLAMA_LOAD_MIRRORS");
-    if (env == nullptr || file.path().empty()) {
+    if (env == nullptr || file.path().empty() || !file.supports_read_at()) {
         return nullptr;
     }
     namespace fs = std::filesystem;
@@ -2098,7 +2098,7 @@ bool llama_model_loader::load_all_data(
     if (!fast_host.empty() || !fast_dev.empty()) {
         LLAMA_LOG_INFO("%s: parallel read of %zu host + %zu device tensors: %d threads, %zu MiB chunks, %s I/O%s\n", __func__,
                 fast_host.size(), fast_dev.size(), fast_threads, fast_chunk / MiB,
-                files.at(0)->has_direct_io() ? "unbuffered" : "buffered",
+                files.at(0)->read_at_alignment() > 1 ? "unbuffered" : "buffered",
                 fast_dev.empty() ? "" : format(", %zu staging buffers", n_buffers).c_str());
 
         // read in file order

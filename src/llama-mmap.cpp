@@ -243,6 +243,8 @@ struct llama_file::impl {
             HANDLE h = CreateEventW(NULL, TRUE, FALSE, NULL);
             ~ev_holder() { if (h) { CloseHandle(h); } }
         } ev;
+        // without an event GetOverlappedResult waits on the file handle, which other threads also signal
+        GGML_ASSERT(ev.h != NULL);
         OVERLAPPED ov = {};
         ov.Offset     = (DWORD) (offset & 0xFFFFFFFFull);
         ov.OffsetHigh = (DWORD) (offset >> 32);
