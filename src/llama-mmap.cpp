@@ -894,11 +894,7 @@ void llama_file::release_buffered() const {
 }
 
 const std::string & llama_file::path() const {
-#ifdef _WIN32
-    return pimpl->fp_name;
-#else
     return pimpl->fname;
-#endif
 }
 
 int llama_file::file_id() const {
